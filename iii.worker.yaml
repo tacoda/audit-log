@@ -1,0 +1,6 @@
+name: audit-log
+runtime:
+  base_image: docker.io/iiidev/python:latest
+scripts:
+  install: pip install -e .
+  start: python src/main.py
