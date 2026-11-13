@@ -9,6 +9,8 @@ if these tests ever need a running worker something has been wired the wrong way
 round.
 """
 
+import asyncio
+import os
 import sys
 import tempfile
 import threading
@@ -101,6 +103,38 @@ class DetectingTampering(unittest.TestCase):
         self.assertFalse(result.ok, "rehashing should not rescue an edit")
 
 
+class TheHead(unittest.TestCase):
+    """What an anchor stores, and why storing it outside matters."""
+
+    def test_an_empty_log_heads_at_genesis(self):
+        self.assertEqual(audit.head([]),
+                         {"seq": -1, "hash": audit.GENESIS, "at": None})
+
+    def test_the_head_names_the_last_entry(self):
+        entries = chain("turn.started", "published")
+        point = audit.head(entries)
+        self.assertEqual(point["seq"], 1)
+        self.assertEqual(point["hash"], entries[-1]["hash"])
+        self.assertEqual(point["at"], entries[-1]["at"])
+
+    def test_a_rebuilt_chain_heads_differently(self):
+        # The attack anchoring exists for: wipe the directory, forge a fresh
+        # consistent chain that says something else. Same seq, other hash.
+        real = chain("turn.started", "approval.resolved")
+        forged = chain("turn.started", "approval.resolved")
+        forged[-1]["actor"] = "someone else"
+        body = {k: v for k, v in forged[-1].items() if k != "hash"}
+        forged[-1]["hash"] = audit.digest(body)
+        self.assertNotEqual(audit.head(real)["hash"], audit.head(forged)["hash"])
+
+    def test_a_tampered_seq_does_not_crash_the_head(self):
+        # parse() accepts whatever JSON the files carry. The head reports a
+        # meaningless head instead of raising. verify names the entry.
+        entries = chain("turn.started")
+        entries[0]["seq"] = "not a number"
+        self.assertEqual(audit.head(entries)["seq"], -1)
+
+
 class Reading(unittest.TestCase):
     def test_a_truncated_last_line_is_skipped_rather_than_fatal(self):
         # Which is what a crash mid-append looks like. Refusing to read the log
@@ -186,6 +220,11 @@ class OnDisk(unittest.TestCase):
         self.assertEqual(report["by"]["kind"]["ladder.refused"], 2)
         self.assertEqual(report["by"]["actor"]["no-secrets"], 2)
 
+    def test_the_head_reconciles_an_anchor(self):
+        self.log.append("turn.started", actor="a")
+        reopened = audit_log.AuditLog(self.tmp.name)
+        self.assertEqual(reopened.head()["seq"], 0)
+
     def test_the_summary_counts_whatever_field_it_is_asked_for(self):
         """The interesting breakdowns are a deployment's own vocabulary, and
         `rung` lives in `detail` rather than at the top level."""
@@ -269,6 +308,88 @@ class TwoWritersAtOnce(unittest.TestCase):
         log = audit_log.AuditLog(self.tmp.name)
         log.append("turn.completed")
         self.assertEqual(len(log.files()), 1)
+class TheWiring(unittest.TestCase):
+    """The handlers the bus calls, exercised without an engine.
+
+    Importing the wiring needs the SDK, which the venv has, and no engine:
+    `register_worker` runs in main(), not at import. A fresh module per test
+    points LOG at a fresh directory, because config() reads the environment
+    once at import.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["AUDIT_LOG_DIR"] = self.tmp.name
+        os.environ["AUDIT_LOG_KINDS"] = "approval.resolved,stage.left"
+        import importlib
+
+        import main
+        self.main = importlib.reload(main)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        os.environ.pop("AUDIT_LOG_DIR", None)
+        os.environ.pop("AUDIT_LOG_KINDS", None)
+
+    def test_an_append_returns_what_the_caller_names(self):
+        answer = asyncio.run(self.main.fn_append(
+            {"kind": "approval.resolved", "actor": "dana", "subject": "pr-7"}))
+        self.assertEqual(answer["seq"], 0)
+        self.assertEqual(len(answer["hash"]), 64)
+        self.assertTrue(answer["known_kind"])
+        entries, _ = self.main.LOG.read()
+        self.assertEqual(entries[-1]["actor"], "dana")
+
+    def test_an_append_without_a_kind_records_nothing(self):
+        answer = asyncio.run(self.main.fn_append({"actor": "dana"}))
+        self.assertIn("error", answer)
+        self.assertEqual(self.main.LOG.read()[0], [])
+
+    def test_an_undeclared_kind_is_recorded_and_flagged(self):
+        answer = asyncio.run(self.main.fn_append({"kind": "brand.new"}))
+        self.assertFalse(answer["known_kind"])
+        self.assertTrue(self.main.LOG.verify().ok)
+
+    def test_verify_reports_a_broken_chain(self):
+        for kind in ("approval.resolved", "stage.left"):
+            asyncio.run(self.main.fn_append({"kind": kind, "actor": "dana"}))
+        path = self.main.LOG.files()[0]
+        path.write_text(path.read_text().replace("dana", "eve"))
+        check = asyncio.run(self.main.fn_verify({}))
+        self.assertFalse(check["ok"])
+
+    def test_read_narrows_by_kind_and_counts_what_matched(self):
+        asyncio.run(self.main.fn_append({"kind": "approval.resolved"}))
+        asyncio.run(self.main.fn_append({"kind": "stage.left"}))
+        answer = asyncio.run(self.main.fn_read({"kind": "stage.left"}))
+        self.assertEqual(answer["total"], 1)
+        self.assertEqual(len(answer["entries"]), 1)
+
+    def test_a_junk_limit_is_an_error_rather_than_a_crash(self):
+        asyncio.run(self.main.fn_append({"kind": "stage.left"}))
+        answer = asyncio.run(self.main.fn_read({"limit": "many"}))
+        self.assertIn("error", answer)
+
+    def test_summary_accepts_the_cli_shape_of_by(self):
+        asyncio.run(self.main.fn_append(
+            {"kind": "approval.resolved", "actor": "dana"}))
+        answer = asyncio.run(self.main.fn_summary({"by": "kind,actor"}))
+        self.assertEqual(answer["by"]["kind"]["approval.resolved"], 1)
+        self.assertEqual(answer["by"]["actor"]["dana"], 1)
+
+    def test_the_head_matches_the_last_append(self):
+        first = asyncio.run(self.main.fn_append({"kind": "approval.resolved"}))
+        second = asyncio.run(self.main.fn_append({"kind": "stage.left"}))
+        point = asyncio.run(self.main.fn_head({}))
+        self.assertEqual(point["seq"], second["seq"])
+        self.assertEqual(point["hash"], second["hash"])
+        self.assertNotEqual(point["hash"], first["hash"])
+
+    def test_the_event_source_returns_what_it_is_called_with(self):
+        # An event source's handler returns the event. Its observers observe
+        # that return value, which is why announce() can be one call.
+        entry = {"seq": 1, "hash": "ab" * 32}
+        self.assertEqual(asyncio.run(self.main.fn_recorded(entry)), entry)
 
 
 if __name__ == "__main__":

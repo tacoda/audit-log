@@ -22,37 +22,31 @@ This file is the wiring.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
 import threading
 from pathlib import Path
 
-from iii import InitOptions, register_worker
-from iii.triggers import TriggerHandler
+from iii import CallAction, InitOptions, register_worker
 
 import audit
 import audit_log
+import schemas
 
 HOME = Path(__file__).resolve().parents[1]
 
 WORKER = None
 
-# Siblings bound to `audit::recorded`. Fan-out happens AFTER the fsync and off
-# the critical path, which is the only place it can happen without weakening the
-# record: a subscriber that is down must not turn a recorded decision into a
-# failed call, and an entry delivered before it is durable is an entry that may
-# never have existed.
-SUBSCRIBERS: list[str] = []
 
-RECORDED_TYPE = {
-    "id": "audit::recorded",
-    "description": (
-        "One entry was sealed into the chain. Carries the whole entry, including "
-        "its sequence number and hash. Bind an observability, alerting or "
-        "shipping worker here. Subscribers are told, never asked: this fires "
-        "after the entry is durable and cannot refuse it."),
-}
+def observer_added(obs) -> None:
+    """One sibling now observes audit::recorded. Logged, nothing more."""
+    print(f"  audit::recorded observed by {getattr(obs, 'target', '?')}")
+
+
+def observer_removed(obs) -> None:
+    print(f"  audit::recorded observation removed: {getattr(obs, 'target', '?')}")
 
 
 def config() -> dict:
@@ -75,43 +69,24 @@ KINDS = SETTINGS["kinds"]
 LOG = audit_log.AuditLog(FOLDER, kinds=KINDS)
 
 
-def announce(item: dict) -> None:
-    """Tell whoever is listening that an entry landed.
+async def announce(item: dict) -> None:
+    """Tell whoever observes audit::recorded that an entry landed.
 
-    Fire-and-forget, and never on the critical path. The entry is already
-    durable; this is only the telling, and a subscriber that is down is a
-    subscriber that missed something rather than a write that failed.
+    One fire-and-forget call, after the fsync and off the critical path. The
+    entry is already durable, so an observer that is down is an observer that
+    missed something rather than a write that failed. The engine delivers to
+    the observers, which is why one call is enough.
+
+    Handlers run on the SDK event loop, so the call has to be the async one:
+    a sync SDK method raises there instead of delivering.
     """
-    if WORKER is None or not SUBSCRIBERS:
+    if WORKER is None:
         return
-    for function_id in list(SUBSCRIBERS):
-        try:
-            WORKER.trigger({"function_id": function_id, "timeout_ms": 5000,
-                            "payload": item})
-        except Exception as exc:  # noqa: BLE001
-            print(f"audit::recorded -> {function_id} failed: "
-                  f"{type(exc).__name__}: {exc}")
-
-
-class RecordedSubscribers(TriggerHandler):
-    """Who is listening for entries.
-
-    The SDK hands a trigger type's owner a handler object rather than a function,
-    and awaits it when a sibling binds or unbinds, so both methods are async. A
-    synchronous one registers without complaint and fails at the first
-    subscription, which is a binding that looks wired and is not.
-    """
-
-    async def register_trigger(self, config) -> None:
-        function_id = str(getattr(config, "function_id", "") or "")
-        if function_id and function_id not in SUBSCRIBERS:
-            SUBSCRIBERS.append(function_id)
-            print(f"  audit::recorded -> {function_id}")
-
-    async def unregister_trigger(self, config) -> None:
-        function_id = str(getattr(config, "function_id", "") or "")
-        if function_id in SUBSCRIBERS:
-            SUBSCRIBERS.remove(function_id)
+    try:
+        await WORKER.call_async({"function_id": "audit::recorded", "payload": item,
+                                 "action": CallAction.Void()})
+    except Exception as exc:  # noqa: BLE001
+        print(f"audit::recorded call failed: {type(exc).__name__}: {exc}")
 
 
 # ------------------------------------------------------------- the surface
@@ -130,7 +105,7 @@ def text(data: dict, key: str) -> str:
     return str(data.get(key) or "")
 
 
-def fn_append(payload: dict) -> dict:
+async def fn_append(payload: dict) -> dict:
     """Record one decision. The only way anything gets into the log.
 
     Returns the entry's sequence number and hash, so a caller that wants to prove
@@ -151,7 +126,7 @@ def fn_append(payload: dict) -> dict:
         print(f"AUDIT WRITE FAILED ({kind}): {type(exc).__name__}: {exc}")
         return {"error": f"{type(exc).__name__}: {exc}"}
 
-    announce(item)
+    await announce(item)
     # An unknown kind is a newer caller, not a bad one. A log that rejected
     # events it had not heard of would stop recording the day something new
     # happened, so this is reported rather than refused.
@@ -159,7 +134,7 @@ def fn_append(payload: dict) -> dict:
             "known_kind": not KINDS or kind in KINDS}
 
 
-def fn_verify(payload: dict) -> dict:
+async def fn_verify(payload: dict) -> dict:
     """Is the chain intact, and from where is it not.
 
     A verifier that answers only yes or no is useless in an audit, where the
@@ -175,14 +150,19 @@ def fn_verify(payload: dict) -> dict:
     }
 
 
-def fn_summary(payload: dict) -> dict:
+async def fn_summary(payload: dict) -> dict:
     """Both halves from one file: whether it can be trusted, and what it counts."""
     data = asked(payload)
-    fields = tuple(data.get("by") or ()) or ("kind", "actor")
+    fields = data.get("by") or ()
+    if isinstance(fields, str):
+        # The bus hands a list. The offline CLI hands `by=kind,actor` as one
+        # string. One coercion, so the two answers cannot drift.
+        fields = [f.strip() for f in fields.split(",") if f.strip()]
+    fields = tuple(fields) or ("kind", "actor")
     return audit_log.summary(FOLDER, kinds=KINDS, breakdowns=fields)
 
 
-def fn_read(payload: dict) -> dict:
+async def fn_read(payload: dict) -> dict:
     """Entries, newest last. `kind` and `subject` narrow it."""
     data = asked(payload)
     entries, problems = LOG.read()
@@ -192,11 +172,14 @@ def fn_read(payload: dict) -> dict:
         if wanted:
             entries = [e for e in entries if e.get(field) == wanted]
 
-    limit = int(data.get("limit") or 200)
+    try:
+        limit = int(data.get("limit") or 200)
+    except (TypeError, ValueError):
+        return {"error": f"limit must be a number, got {data.get('limit')!r}"}
     return {"entries": entries[-limit:], "total": len(entries), "problems": problems}
 
 
-def fn_tally(payload: dict) -> dict:
+async def fn_tally(payload: dict) -> dict:
     """Count entries by any field, narrowed to one kind.
 
     A deployment's interesting breakdowns are its own vocabulary. Counting
@@ -208,6 +191,28 @@ def fn_tally(payload: dict) -> dict:
     return {"counts": audit.tally(entries, by=text(data, "by") or "kind",
                                   kind=text(data, "kind")),
             "total": len(entries)}
+
+
+async def fn_head(payload: dict) -> dict:
+    """The chain head: the one fact an anchor stores.
+
+    `audit::recorded` hands every subscriber the head as it lands. This is the
+    same fact for an anchor that was down, or for a third party that wants to
+    know whether the log it anchored is still the log on disk.
+    """
+    return LOG.head()
+
+
+async def fn_recorded(event: dict) -> dict:
+    """The event source behind the announcement.
+
+    An event source returns the event it is called with, and its observers
+    observe that return value. Only this worker may call it, and it fires
+    once per sealed entry, always after the fsync. An observer therefore
+    never sees an entry that is not durable. Bind with
+    `worker.observe(\"audit::recorded\", \"your::function\")`.
+    """
+    return event
 
 
 # --------------------------------------------------------------- offline
@@ -222,6 +227,7 @@ OFFLINE = {
     "summary": fn_summary,
     "read": fn_read,
     "tally": fn_tally,
+    "head": fn_head,
 }
 
 
@@ -233,9 +239,13 @@ def summarise() -> int:
     """
     check = LOG.verify()
     counts = audit.tally(LOG.read()[0])
+    point = LOG.head()
     print(f"{check.entries} entries in {FOLDER}")
     print(f"  chain    : {'intact' if check.ok else 'BROKEN'}, "
           f"verified through {check.verified_through}")
+    print(f"  head     : seq {point['seq']} {point['hash'][:16]}…")
+    print("  anchor this pair somewhere the log directory cannot reach. "
+          "audit::recorded hands the head to observers on every entry")
     for kind, count in counts.items():
         print(f"  {count:6}  {kind}")
     for problem in check.problems:
@@ -255,7 +265,8 @@ def cli(argv: list[str]) -> int:
               f"{', '.join(sorted(OFFLINE))}")
         return 2
 
-    answer = handler(dict(t.split("=", 1) for t in argv[1:] if "=" in t))
+    answer = asyncio.run(
+        handler(dict(t.split("=", 1) for t in argv[1:] if "=" in t)))
     print(json.dumps(answer, indent=2, default=str))
     return 1 if answer.get("error") else 0
 
@@ -263,7 +274,15 @@ def cli(argv: list[str]) -> int:
 def main() -> None:
     global WORKER
     url = os.environ.get("III_URL", "ws://localhost:49134")
-    WORKER = register_worker(url, InitOptions(worker_name="audit-log"))
+    WORKER = register_worker(url, InitOptions(
+        worker_name="audit-log",
+        worker_description=("Append-only, hash-chained audit log of human "
+                            "decisions. Callers append, this worker fsyncs, "
+                            "chains and announces.")))
+
+    # By id, and before the registration, so the hooks see every observer.
+    WORKER.on_observer_added("audit::recorded", observer_added)
+    WORKER.on_observer_removed("audit::recorded", observer_removed)
 
     for function_id, handler, description in (
         ("audit::append", fn_append,
@@ -274,17 +293,32 @@ def main() -> None:
          "What the log says: whether it verifies, and what it counts"),
         ("audit::read", fn_read, "Entries, optionally narrowed by kind or subject"),
         ("audit::tally", fn_tally, "Count entries by any field, narrowed to one kind"),
+        ("audit::head", fn_head,
+         "The chain head, seq and hash. The fact an anchor stores"),
     ):
-        WORKER.register_function(function_id, handler, description=description)
+        spec = schemas.FUNCTIONS[function_id]
+        WORKER.register_function(function_id, handler, description=description,
+                                 request_format=spec["request"],
+                                 response_format=spec["response"])
 
-    WORKER.register_trigger_type(RECORDED_TYPE, RecordedSubscribers())
+    # The event source is private: only this worker calls it, and only here.
+    # Every other worker may observe it.
+    WORKER.register_function(
+        "audit::recorded", fn_recorded,
+        description=("The sealed-entry event source. Observe it: your target "
+                     "receives the entry, seq and hash included. Private, so "
+                     "only this worker fires it"),
+        request_format=schemas.ENTRY, response_format=schemas.ENTRY,
+        private=True)
 
     check = LOG.verify()
+    point = LOG.head()
     print(f"audit-log ready on {url}")
     print(f"  log      : {FOLDER}")
-    print(f"  entries  : {check.entries} ({'intact' if check.ok else 'BROKEN'})")
+    print(f"  entries  : {check.entries} ({'intact' if check.ok else 'BROKEN'}), "
+          f"head seq {point['seq']}")
     print(f"  kinds    : {', '.join(KINDS) if KINDS else 'undeclared, nothing checked'}")
-    print("  emits    : audit::recorded")
+    print("  announces: audit::recorded (private, observe it from any worker)")
     print("  one writer, by construction: this process owns the chain")
     for problem in check.problems[:5]:
         print(f"  PROBLEM: {problem}")

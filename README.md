@@ -5,10 +5,11 @@
 **An append-only, tamper-evident record, as an [iii](https://iii.dev) worker.**
 One writer, fsynced before it answers, and every entry chained to the one before
 it. Nothing here decides anything: callers append, this worker remembers, and
-whoever cares subscribes.
+whoever cares observes. It needs iii 0.26.0 or newer, because it speaks
+observers.
 
 ```bash
-iii worker add audit-log
+iii call compose::add worker=audit-log
 ```
 
 ## The idea
@@ -45,7 +46,7 @@ shipping entries elsewhere would have to keep its tail in memory, which is the
 bug below.
 
 **You cannot delegate durability.** Property 2 is an fsync *before* the answer.
-Fan-out has to be fire-and-forget: a subscriber that is down must not turn a
+Fan-out has to be fire-and-forget: an observer that is down must not turn a
 recorded decision into a failed call. Nothing fire-and-forget can promise an
 entry is durable.
 
@@ -53,20 +54,29 @@ So this worker owns its files. What it can do is tell everybody afterward.
 
 ## It announces what it recorded
 
-`audit::recorded` is a trigger type this worker emits once it seals an entry. It
-carries the whole entry, including the sequence number and hash.
+`audit::recorded` is a private, observable function. After the fsync seals an
+entry, this worker calls it once. The engine then delivers the entry to every
+worker that observes the function. The event carries the whole entry,
+including the sequence number and hash.
 
-```bash
-iii trigger engine::register_trigger --json '{"type":"audit::recorded","function_id":"iii-observability::ingest"}'
+```python
+worker.observe("audit::recorded", "my-worker::on-decision")
 ```
 
-Bind an observability worker and every decision shows up in your traces. Bind a
-shipper and it reaches your SIEM. Bind an alerter to watch for one kind. None of
-them can weaken the record, because the emit happens after the fsync and off the
-critical path, and a subscriber is told rather than asked.
+Bind an observability worker and every decision shows up in your traces.
+Bind an alerting worker to watch for one kind. Bind an anchoring worker and
+it stores each head somewhere the log directory cannot reach.
 
-That split is deliberate. A record that lives inside the thing it records is not
-independent of it, so the deciding belongs to the callers and the remembering
+None of them can weaken the record. The function is private, so only this
+worker can fire it. It fires after the entry is durable. The engine delivers
+the news off the critical path. An observer is told, never asked.
+
+Your target receives the Observed payload. The entry sits under `input`, and
+under `output` too. An event source returns what it is called with. Narrow
+with `capture` or `filters` when you want less.
+
+That split is deliberate. A record that lives inside the thing it records is
+not independent of it. The deciding belongs to the callers. The remembering
 belongs here.
 
 ## Functions
@@ -78,6 +88,8 @@ belongs here.
 | `audit::summary` | whether it can be trusted, and what it counts |
 | `audit::read` | entries, narrowed by `kind` or `subject` |
 | `audit::tally` | count by any field, narrowed to one kind |
+| `audit::head` | the chain head: the pair an anchor stores |
+| `audit::recorded` | the sealed-entry event source. Observe it; only this worker fires it |
 
 `append` returns the sequence number and hash, so a caller that wants to prove it
 recorded something has both to name.
@@ -139,8 +151,8 @@ successors verify as one history.
   policy the audited operator can change is the thing this exists to avoid. When
   you need old entries gone, move the sealed files yourself and know the chain
   no longer verifies from the beginning.
-- **It does not replicate.** One directory, one machine. Bind a subscriber and
-  ship them somewhere if you need a second copy.
+- **It does not replicate.** One directory, one machine. Observe the log from
+  another worker and ship the entries onward if you need a second copy.
 - **It does not encrypt or sign.** The chain proves nothing was changed after the
   fact. It does not prove who wrote it, and a determined operator with write
   access to the whole directory can rebuild a consistent chain from scratch. If
@@ -162,10 +174,11 @@ enforce the invariant it depends on rather than assume it.
 
 ## Status
 
-Early. 26 tests cover the chain, the store and the concurrent-writer case, and
-none of them needs an engine. No live contract test covers the worker's own
-wiring yet, including the `audit::recorded` fan-out. Treat that subscription path
-as unproven.
+Early. 40 tests cover the chain, the store, the handlers the engine calls and
+the concurrent-writer case. None of them needs an engine. A fresh Pyright run
+over the wiring reports no problems. The live path ran on an 0.26 engine:
+registration, append over `iii call`, head, and observer delivery of the
+sealed entry all verified.
 
 ## License
 

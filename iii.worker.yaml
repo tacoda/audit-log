@@ -1,6 +1,22 @@
+iii: v1
 name: audit-log
+language: python
+deploy: bundle
+manifest: pyproject.toml
+description: >-
+  Append-only, hash-chained record of every human decision.
+  Tamper-evident on its own. Tamper-proof once the chain head is
+  anchored outside.
+license: MIT
+repo: https://github.com/tacoda/audit-log
+tags: [audit, compliance, provenance, accountability, approvals]
+experimental: true
+config:
+  AUDIT_LOG_DIR: ./audit
+  AUDIT_LOG_KINDS: ""
+  III_URL: ws://localhost:49134
 runtime:
   base_image: docker.io/iiidev/python:latest
 scripts:
-  install: pip install -e .
+  install: pip install -r requirements.txt
   start: python src/main.py

@@ -163,6 +163,34 @@ def verify(entries: list[dict], kinds: tuple[str, ...] = ()) -> Verification:
     return result
 
 
+def head(entries: list[dict]) -> dict:
+    """The chain head: the one fact an anchor holds onto.
+
+    An anchor stores this outside the log directory the moment it hears of it
+    (`audit::recorded`), and checks it later with `audit::head`. The chain
+    already catches edits, reorders and deletions inside the files; the head
+    catches the attack the files cannot see, rebuilding the whole directory as
+    a fresh consistent chain. A rebuilt chain hashes differently at the same
+    sequence number, so a stored head stops matching and a reader that never
+    trusts the log's own files catches it.
+
+    `seq` is -1 and `hash` the genesis constant for an empty log, so an anchor
+    can hold a head for a log that has not recorded anything yet.
+    """
+    if not entries:
+        return {"seq": -1, "hash": GENESIS, "at": None}
+    last = entries[-1]
+    try:
+        seq = int(last["seq"])
+        at = last.get("at")
+    except (TypeError, ValueError):
+        # The files carry whatever JSON they carry. A tampered seq crashes
+        # nothing here: verify names the entry, and a broken chain makes
+        # the head meaningless.
+        seq, at = -1, None
+    return {"seq": seq, "hash": str(last.get("hash")), "at": at}
+
+
 def parse(text: str) -> tuple[list[dict], list[str]]:
     """Read a JSONL log. A malformed line is reported and skipped.
 

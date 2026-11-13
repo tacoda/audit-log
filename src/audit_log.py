@@ -102,6 +102,16 @@ class AuditLog:
             result.ok = False
         return result
 
+    def head(self) -> dict:
+        """The current chain head, for an anchor catching up after downtime.
+
+        Same files, one read. An anchor that subscribes to `audit::recorded`
+        never needs to ask, but one that was down asks here instead of
+        trusting its own memory of where the chain went.
+        """
+        entries, _problems = self.read()
+        return audit.head(entries)
+
     # ----------------------------------------------------------- writing
 
     def _tail(self) -> dict | None:
