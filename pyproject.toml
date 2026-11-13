@@ -1,12 +1,12 @@
 [project]
 name = "audit-log"
-version = "0.1.0"
+version = "0.1.1"
 description = "An append-only, tamper-evident record as an iii worker: one writer, fsynced, hash-chained"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "iii-sdk==0.22.1",
-    "iii-helpers==0.22.1",
+    "iii-sdk==0.26.0",
+    "iii-helpers==0.26.0",
 ]
 
 [build-system]
